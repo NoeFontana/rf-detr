@@ -25,6 +25,7 @@ from torch.optim.lr_scheduler import LRScheduler, ReduceLROnPlateau
 
 from rfdetr._namespace import _namespace_from_configs
 from rfdetr.config import (
+    _MANAGED_SCHEDULER_DEFAULTS,
     ModelConfig,
     MultiScale,
     TrainConfig,
@@ -290,8 +291,8 @@ def _build_managed_scheduler(
 
     Preserves RF-DETR's built-in schedule: a linear warmup ramp over ``warmup_steps`` followed by
     either cosine annealing down to ``min_factor`` or a 10x step decay after ``lr_drop`` epochs. The
-    ``min_factor`` and ``lr_drop`` values are read from ``lr_scheduler_kwargs`` first (the current API),
-    falling back to the deprecated ``lr_min_factor`` / ``lr_drop`` fields.
+    ``min_factor`` and ``lr_drop`` values are read from ``lr_scheduler_kwargs``, falling back to
+    ``_MANAGED_SCHEDULER_DEFAULTS`` when a key is absent.
 
     Args:
         optimizer: The optimizer the scheduler drives.
@@ -306,8 +307,8 @@ def _build_managed_scheduler(
     kwargs = train_config.lr_scheduler_kwargs
     # Managed presets are always strings (guaranteed by the _is_managed_scheduler_name branch at the call site).
     preset = cast(str, train_config.lr_scheduler).strip().lower()
-    min_factor = float(kwargs.get("min_factor", train_config.lr_min_factor))
-    lr_drop = int(kwargs.get("lr_drop", train_config.lr_drop))
+    min_factor = float(kwargs.get("min_factor", _MANAGED_SCHEDULER_DEFAULTS["min_factor"]))
+    lr_drop = int(kwargs.get("lr_drop", _MANAGED_SCHEDULER_DEFAULTS["lr_drop"]))
 
     def lr_lambda(current_step: int) -> float:
         if current_step < warmup_steps:
@@ -785,11 +786,10 @@ class RFDETRModelModule(LightningModule):
             loss_for_backward = None
         weight_dict = self.criterion.weight_dict
         loss: Tensor = torch.stack([loss_dict[k] * weight_dict[k] for k in loss_dict if k in weight_dict]).sum()
-        # Automatic optimization path: divide by accumulate_grad_batches so the accumulated
-        # gradient matches a single large batch, matching the legacy engine.  PTL accumulates
-        # full-scale gradients by default; dividing here keeps the effective LR identical.
-        accumulate_grad_batches = max(1, int(self.trainer.accumulate_grad_batches))
-        loss_for_return = loss if self._use_manual_optimization else loss / accumulate_grad_batches
+        # Automatic optimization path: return the loss unscaled. Lightning divides the returned loss by
+        # ``trainer.accumulate_grad_batches`` itself (``ClosureResult.from_training_step_output``) before
+        # ``backward()``, so the accumulated gradient already equals the mean over the window; dividing here as
+        # well scaled every accumulated gradient by ``1/N**2``. The manual path scales its own backward loss above.
         train_log_sync_dist = bool(self.train_config.train_log_sync_dist)
         train_log_on_step = bool(self.train_config.train_log_on_step)
         if self.train_config.compact_train_metrics:
@@ -854,11 +854,11 @@ class RFDETRModelModule(LightningModule):
                 }
                 results = self.postprocess(inference_outputs, orig_sizes)
             return {
-                "loss": loss_for_return.detach() if self._use_manual_optimization else loss_for_return,
+                "loss": loss.detach() if self._use_manual_optimization else loss,
                 "results": self._detach_results(results),
                 "targets": targets,
             }
-        return loss_for_return.detach() if self._use_manual_optimization else loss_for_return
+        return loss.detach() if self._use_manual_optimization else loss
 
     def _aux_aggregate_map(self, loss_dict: dict[str, Tensor], weight_dict: dict[str, float]) -> dict[str, str | None]:
         """Return the memoized ``loss_name -> aggregate train/ key`` map for the current loss_dict keys.
